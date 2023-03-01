@@ -183,6 +183,9 @@ class XComArg(ResolveMixin, DependencyMixin):
     def zip(self, *others: XComArg, fillvalue: Any = NOTSET) -> ZipXComArg:
         return ZipXComArg([self, *others], fillvalue=fillvalue)
 
+    def chain(self, *others: XComArg) -> ChainXComArg:
+        return ChainXComArg([self, *others])
+
     def get_task_map_length(self, run_id: str, *, session: Session) -> int | None:
         """Inspect length of pushed value for task-mapping.
 
@@ -296,6 +299,11 @@ class PlainXComArg(XComArg):
         if self.key != XCOM_RETURN_KEY:
             raise ValueError("cannot map against non-return XCom")
         return super().zip(*others, fillvalue=fillvalue)
+
+    def chain(self, *others: XComArg) -> ChainXComArg:
+        if self.key != XCOM_RETURN_KEY:
+            raise ValueError("cannot chain non-return XCom")
+        return super().chain(*others)
 
     def get_task_map_length(self, run_id: str, *, session: Session) -> int | None:
         from airflow.models.taskmap import TaskMap
@@ -500,10 +508,55 @@ class ZipXComArg(XComArg):
         return _ZipResult(values, fillvalue=self.fillvalue)
 
 
+class ChainXComArg(XComArg):
+    """An XCom reference with ``chain()`` applied.
+
+    This is constructed from multiple XComArg instances, and presents an
+    iterable that "chains" them together.
+    """
+
+    def __init__(self, args: Sequence[XComArg]) -> None:
+        if not args:
+            raise ValueError("At least one input is required")
+        self.args = args
+
+    def __repr__(self) -> str:
+        args_iter = iter(self.args)
+        first = repr(next(args_iter))
+        rest = ", ".join(repr(arg) for arg in args_iter)
+        return f"{first}.chain({rest})"
+
+    def _serialize(self) -> dict[str, Any]:
+        args = [serialize_xcom_arg(arg) for arg in self.args]
+        return {"args": args}
+
+    @classmethod
+    def _deserialize(cls, data: dict[str, Any], dag: DAG) -> XComArg:
+        return cls(
+            [deserialize_xcom_arg(arg, dag) for arg in data["args"]],
+        )
+
+    def iter_references(self) -> Iterator[tuple[Operator, str]]:
+        for arg in self.args:
+            yield from arg.iter_references()
+
+    def get_task_map_length(self, run_id: str, *, session: Session) -> int | None:
+        all_lengths = (arg.get_task_map_length(run_id, session=session) for arg in self.args)
+        ready_lengths = [length for length in all_lengths if length is not None]
+        if len(ready_lengths) != len(self.args):
+            return None  # If any of the referenced XComs is not ready, we are not ready either.
+        return sum(ready_lengths)
+
+    @provide_session
+    def resolve(self, context: Context, session: Session = NEW_SESSION) -> Any:
+        return [value for arg in self.args for value in arg.resolve(context, session=session)]
+
+
 _XCOM_ARG_TYPES: Mapping[str, type[XComArg]] = {
     "": PlainXComArg,
     "map": MapXComArg,
     "zip": ZipXComArg,
+    "chain": ChainXComArg,
 }
 
 
