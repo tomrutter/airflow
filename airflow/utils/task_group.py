@@ -28,7 +28,7 @@ import re
 import weakref
 from typing import TYPE_CHECKING, Any, Generator, Iterator, Sequence
 
-from airflow.compat.functools import cache
+from airflow.compat.functools import cache, cached_property
 from airflow.exceptions import (
     AirflowDagCycleException,
     AirflowException,
@@ -135,7 +135,7 @@ class TaskGroup(DAGNode):
         # if given group_id already used assign suffix by incrementing largest used suffix integer
         # Example : task_group ==> task_group__1 -> task_group__2 -> task_group__3
         self._group_id = group_id
-        self._check_for_group_id_collisions(add_suffix_on_collision)
+        self._check_for_group_id_collisions(add_suffix_on_collision, parent_group)
 
         self.children: dict[str, DAGNode] = {}
 
@@ -167,9 +167,9 @@ class TaskGroup(DAGNode):
             return
         # if given group_id already used assign suffix by incrementing largest used suffix integer
         # Example : task_group ==> task_group__1 -> task_group__2 -> task_group__3
-        if self._group_id in self.used_group_ids:
+        if group_id in self.used_group_ids:
             if not add_suffix_on_collision:
-                raise DuplicateTaskIdFound(f"group_id '{self._group_id}' has already been added to the DAG")
+                raise DuplicateTaskIdFound(f"group_id '{group_id}' has already been added to the DAG")
             base = re.split(r"__\d+$", self._group_id)[0]
             suffixes = sorted(
                 int(re.split(r"^.+__", used_group_id)[1])
@@ -246,10 +246,11 @@ class TaskGroup(DAGNode):
         self.used_group_ids.remove(key)
         del self.children[key]
 
-    @property
+    @cached_property
     def group_id(self) -> str | None:
         """group_id of this TaskGroup."""
-        if self.task_group and self.task_group.prefix_group_id and self.task_group.group_id:
+        if self.task_group:
+            # defer to parent whether it adds a prefix
             return self.task_group.child_id(self._group_id)
 
         return self._group_id
@@ -333,12 +334,17 @@ class TaskGroup(DAGNode):
     def __exit__(self, _type, _value, _tb):
         TaskGroupContext.pop_context_managed_task_group()
 
+    @property
+    def all_child_tasknames(self):
+        return {task.task_id for task in self}
+
     def has_task(self, task: BaseOperator) -> bool:
         """Returns True if this TaskGroup or its children TaskGroups contains the given task."""
         if task.task_id in self.children:
             return True
 
-        return any(child.has_task(task) for child in self.children.values() if isinstance(child, TaskGroup))
+        return task.task_id in self.all_child_tasknames
+        # return any(child.has_task(task) for child in self.children.values() if isinstance(child, TaskGroup))
 
     @property
     def roots(self) -> list[BaseOperator]:
@@ -355,8 +361,11 @@ class TaskGroup(DAGNode):
         Returns a generator of tasks that are root tasks, i.e. those with no upstream
         dependencies within the TaskGroup.
         """
+        all_child_tasknames = self.all_child_tasknames
         for task in self:
-            if not any(self.has_task(parent) for parent in task.get_direct_relatives(upstream=True)):
+            if not all_child_tasknames.intersection(task.get_direct_relative_ids(upstream=True)):
+            # if not any(parent_id in all_child_tasknames for parent_id in task.get_direct_relative_ids(upstream=True)):
+            # if not any(self.has_task(parent) for parent in task.get_direct_relatives(upstream=True)):
                 yield task
 
     def get_leaves(self) -> Generator[BaseOperator, None, None]:
@@ -364,8 +373,11 @@ class TaskGroup(DAGNode):
         Returns a generator of tasks that are leaf tasks, i.e. those with no downstream
         dependencies within the TaskGroup
         """
+        all_child_tasknames = self.all_child_tasknames
         for task in self:
-            if not any(self.has_task(child) for child in task.get_direct_relatives(upstream=False)):
+            if not all_child_tasknames.intersection(task.get_direct_relative_ids(upstream=False)):
+            # if not any(parent_id in all_child_tasknames for parent_id in task.get_direct_relative_ids(upstream=False)):
+            # if not any(self.has_task(child) for child in task.get_direct_relatives(upstream=False)):
                 yield task
 
     def child_id(self, label):
@@ -373,8 +385,10 @@ class TaskGroup(DAGNode):
         Prefix label with group_id if prefix_group_id is True. Otherwise return the label
         as-is.
         """
-        if self.prefix_group_id and self.group_id:
-            return f"{self.group_id}.{label}"
+        if self.prefix_group_id:
+            group_id = self.group_id
+            if group_id:
+                return f"{group_id}.{label}"
 
         return label
 
