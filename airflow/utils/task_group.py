@@ -162,11 +162,15 @@ class TaskGroup(DAGNode):
             # TODO: This might not be the ideal place to check this.
             raise AirflowException("Task groups cannot be marked as setup or teardown.")
 
-    def _check_for_group_id_collisions(self, add_suffix_on_collision: bool):
+    def _check_for_group_id_collisions(self, add_suffix_on_collision: bool, parent_group: TaskGroup | None):
         if self._group_id is None:
             return
         # if given group_id already used assign suffix by incrementing largest used suffix integer
         # Example : task_group ==> task_group__1 -> task_group__2 -> task_group__3
+        group_id = self._group_id
+        if parent_group:
+            group_id = self.task_group.child_id(self._group_id)
+
         if group_id in self.used_group_ids:
             if not add_suffix_on_collision:
                 raise DuplicateTaskIdFound(f"group_id '{group_id}' has already been added to the DAG")
