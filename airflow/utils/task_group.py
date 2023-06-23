@@ -100,6 +100,8 @@ class TaskGroup(DAGNode):
 
         dag = dag or DagContext.get_current_dag()
 
+        self.children: dict[str, DAGNode] = {}
+
         if group_id is None:
             # This creates a root TaskGroup.
             if parent_group:
@@ -108,6 +110,7 @@ class TaskGroup(DAGNode):
             # of used group_id to avoid duplication.
             self.used_group_ids = set()
             self.dag = dag
+            self._group_id = group_id
         else:
             if prefix_group_id:
                 # If group id is used as prefix, it should not contain spaces nor dots
@@ -130,20 +133,15 @@ class TaskGroup(DAGNode):
                     "Cannot mix TaskGroups from different DAGs: %s and %s", dag, parent_group.dag
                 )
 
+            # these must be fully resolved ids (i.e. including any parent task group prefixes)
             self.used_group_ids = parent_group.used_group_ids
 
-        # if given group_id already used assign suffix by incrementing largest used suffix integer
-        # Example : task_group ==> task_group__1 -> task_group__2 -> task_group__3
-        self._group_id = group_id
-        self._check_for_group_id_collisions(add_suffix_on_collision, parent_group)
-
-        self.children: dict[str, DAGNode] = {}
-
-        if parent_group:
+            # if given group_id already used assign suffix by incrementing largest used suffix integer
+            # Example : task_group ==> task_group__1 -> task_group__2 -> task_group__3
+            self._group_id = parent_group.check_for_child_id_collisions(group_id, add_suffix_on_collision)
             parent_group.add(self)
 
-        self.used_group_ids.add(self.group_id)
-        if self.group_id:
+            self.used_group_ids.add(self.group_id)
             self.used_group_ids.add(self.downstream_join_id)
             self.used_group_ids.add(self.upstream_join_id)
 
@@ -162,28 +160,28 @@ class TaskGroup(DAGNode):
             # TODO: This might not be the ideal place to check this.
             raise AirflowException("Task groups cannot be marked as setup or teardown.")
 
-    def _check_for_group_id_collisions(self, add_suffix_on_collision: bool, parent_group: TaskGroup | None):
-        if self._group_id is None:
+    def check_for_child_id_collisions(self, child_id: str, add_suffix_on_collision: bool):
+        if child_id is None:
             return
         # if given group_id already used assign suffix by incrementing largest used suffix integer
         # Example : task_group ==> task_group__1 -> task_group__2 -> task_group__3
-        group_id = self._group_id
-        if parent_group:
-            group_id = self.task_group.child_id(self._group_id)
+        full_child_id = self.child_id(child_id)
 
-        if group_id in self.used_group_ids:
+        if full_child_id in self.used_group_ids:
             if not add_suffix_on_collision:
-                raise DuplicateTaskIdFound(f"group_id '{group_id}' has already been added to the DAG")
-            base = re.split(r"__\d+$", self._group_id)[0]
+                raise DuplicateTaskIdFound(f"item '{full_child_id}' has already been added to the DAG")
+            base = re.split(r"__\d+$", child_id)[0]
+            full_base = self.child_id(base)
             suffixes = sorted(
                 int(re.split(r"^.+__", used_group_id)[1])
                 for used_group_id in self.used_group_ids
-                if used_group_id is not None and re.match(rf"^{base}__\d+$", used_group_id)
+                if used_group_id is not None and re.match(rf"^{full_base}__\d+$", used_group_id)
             )
             if not suffixes:
-                self._group_id += "__1"
+                child_id += "__1"
             else:
-                self._group_id = f"{base}__{suffixes[-1] + 1}"
+                child_id = f"{base}__{suffixes[-1] + 1}"
+        return child_id
 
     @classmethod
     def create_root(cls, dag: DAG) -> TaskGroup:
@@ -348,7 +346,7 @@ class TaskGroup(DAGNode):
             return True
 
         return task.task_id in self.all_child_tasknames
-        # return any(child.has_task(task) for child in self.children.values() if isinstance(child, TaskGroup))
+        # return any(task.task_id == t for t in self)
 
     @property
     def roots(self) -> list[BaseOperator]:
@@ -368,8 +366,6 @@ class TaskGroup(DAGNode):
         all_child_tasknames = self.all_child_tasknames
         for task in self:
             if not all_child_tasknames.intersection(task.get_direct_relative_ids(upstream=True)):
-            # if not any(parent_id in all_child_tasknames for parent_id in task.get_direct_relative_ids(upstream=True)):
-            # if not any(self.has_task(parent) for parent in task.get_direct_relatives(upstream=True)):
                 yield task
 
     def get_leaves(self) -> Generator[BaseOperator, None, None]:
@@ -380,8 +376,6 @@ class TaskGroup(DAGNode):
         all_child_tasknames = self.all_child_tasknames
         for task in self:
             if not all_child_tasknames.intersection(task.get_direct_relative_ids(upstream=False)):
-            # if not any(parent_id in all_child_tasknames for parent_id in task.get_direct_relative_ids(upstream=False)):
-            # if not any(self.has_task(child) for child in task.get_direct_relatives(upstream=False)):
                 yield task
 
     def child_id(self, label):

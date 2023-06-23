@@ -137,7 +137,11 @@ def get_unique_task_id(
     # We need to check if we are in the context of TaskGroup as the task_id may
     # already be altered
     task_group = task_group or TaskGroupContext.get_current_task_group(dag)
-    tg_task_id = task_group.child_id(task_id) if task_group else task_id
+    if task_group:
+        task_id = task_group.check_for_child_id_collisions(task_id, True)
+        tg_task_id = task_group.child_id(task_id)
+    else:
+        tg_task_id = task_id
 
     if tg_task_id not in dag.task_ids:
         return task_id
